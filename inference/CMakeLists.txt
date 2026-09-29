@@ -1,142 +1,36 @@
-cmake_minimum_required(VERSION 3.10)
-project(FlowSim)
-
-# Set the C++ standard to C++17
+cmake_minimum_required(VERSION 3.16)
+project(m4_native LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Optimization flags for maximum performance
-#set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fPIC -march=native -mtune=native -ffast-math -funroll-loops -fopenmp -fno-exceptions -fno-plt -floop-parallelize-all -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-g -O3")
-
-set(CMAKE_BUILD_TYPE Debug)
-
-
-# Use CONDA_PREFIX to dynamically locate the LibTorch path
-if(DEFINED ENV{CONDA_PREFIX})
-    set(CONDA_PREFIX $ENV{CONDA_PREFIX})
-else()
-    message(FATAL_ERROR "CONDA_PREFIX is not set. Please activate your conda environment.")
+# CMAKE_PREFIX_PATH is the active Python Torch's torch/share/cmake directory.
+# Link its packaged LibTorch directly: TorchConfig asks for a CUDA toolkit even
+# when the wheel already carries the runtime libraries needed for this target.
+if(NOT CMAKE_PREFIX_PATH)
+    message(FATAL_ERROR "Pass -DCMAKE_PREFIX_PATH=$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')")
 endif()
-
-# Adjust the Python version in the path if necessary
-set(CMAKE_PREFIX_PATH "${CONDA_PREFIX}/lib/python3.10/site-packages/torch/share/cmake/Torch")
-
-# Find the Torch package
-find_package(Torch REQUIRED)
-
-# Include directories
-include_directories("${CONDA_PREFIX}/include")
-include_directories(${TORCH_INCLUDE_DIRS})
-#include_directories("/data1/lichenni/projects/per-flow-sim/flowsim/yaml-cpp/build")
-
-# Add shared library target
-#add_library(inference_shared SHARED src/inference.cpp)
-#add_library(flowsim SHARED main.cpp)
-
-set(SOURCES
-    main_m4.cpp
-    Device.h
-    Device.cpp
-    Chunk.h
-    Chunk.cpp
-    Event.h
-    Event.cpp
-    EventQueue.h 
-    EventQueue.cpp 
-    Link.h 
-    Link.cpp 
-    TopologyBuilder.h 
-    TopologyBuilder.cpp 
-    Topology.h 
-    Topology.cpp 
-    Type.h
-)
-
-set(FLOWSIM
-    flowsim.cpp
-    Device.h
-    Device.cpp
-    Chunk.h
-    Chunk.cpp
-    Event.h
-    Event.cpp
-    EventQueue.h 
-    EventQueue.cpp 
-    Link.h 
-    Link.cpp 
-    TopologyBuilder.h 
-    TopologyBuilder.cpp 
-    Topology.h 
-    Topology.cpp 
-    Type.h
-)
-
-SET(NOFLOWSIM_SOURCES
-    main_m4_noflowsim.cpp
-    Device.h
-    Device.cpp
-    Chunk.h
-    Chunk.cpp
-    Event.h
-    Event.cpp
-    EventQueue.h 
-    EventQueue.cpp 
-    Link.h 
-    Link.cpp 
-    TopologyBuilder.h 
-    TopologyBuilder.cpp 
-    Topology.h 
-    Topology.cpp 
-    Type.h
-)
-
-# Add executable target (only main.cpp)
-add_executable(flowsim ${SOURCES})
-add_executable(no_flowsim ${NOFLOWSIM_SOURCES})
-add_executable(pure_flowsim ${FLOWSIM})
-
-# Link the Torch library and inference_shared to inference_executable
-target_link_libraries(flowsim "${TORCH_LIBRARIES}")
-target_link_libraries(no_flowsim "${TORCH_LIBRARIES}")
-
-#add_subdirectory(rapidyaml/ext/c4core)
-add_subdirectory(rapidyaml)
-
-target_include_directories(flowsim PRIVATE rapidyaml/src rapidyaml/src/c4)
-target_link_libraries(flowsim ryml)
-
-target_include_directories(no_flowsim PRIVATE rapidyaml/src rapidyaml/src/c4)
-target_link_libraries(no_flowsim ryml)
-
-target_include_directories(pure_flowsim PRIVATE rapidyaml/src rapidyaml/src/c4)
-
-# Enable link-time optimization
-#set_property(TARGET inference_shared PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-set_property(TARGET flowsim PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-set_property(TARGET no_flowsim PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-set_property(TARGET pure_flowsim PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-
-# CUDA-specific optimizations (if using GPU)
-if (TORCH_CUDA_ARCH_LIST)
-    #set_target_properties(inference_shared PROPERTIES CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
-    set_target_properties(flowsim PROPERTIES CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
-    set_target_properties(no_flowsim PROPERTIES CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
+get_filename_component(TORCH_ROOT "${CMAKE_PREFIX_PATH}/../.." ABSOLUTE)
+if(NOT EXISTS "${TORCH_ROOT}/include/torch/csrc/api/include/torch/torch.h" OR
+   NOT EXISTS "${TORCH_ROOT}/lib/libtorch.so")
+    message(FATAL_ERROR "CMAKE_PREFIX_PATH does not point to an installed Python Torch package")
 endif()
-
-# Set RPATH to find Torch libraries at runtime
-#set_target_properties(inference_shared PROPERTIES
-#    BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-#    INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-#)
-
-set_target_properties(flowsim PROPERTIES
-    BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-    INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-)
-
-set_target_properties(no_flowsim PROPERTIES
-    BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-    INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
-)
-
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+    OUTPUT_VARIABLE TORCH_CXX11_ABI OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE TORCH_QUERY_RESULT)
+if(NOT TORCH_QUERY_RESULT EQUAL 0 OR NOT TORCH_CXX11_ABI MATCHES "^[01]$")
+    message(FATAL_ERROR "Python3_EXECUTABLE must be the Python used by this Torch installation")
+endif()
+add_executable(no_flowsim main_m4_noflowsim.cpp)
+target_include_directories(no_flowsim PRIVATE
+    "${TORCH_ROOT}/include"
+    "${TORCH_ROOT}/include/torch/csrc/api/include")
+target_compile_definitions(no_flowsim PRIVATE _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
+target_compile_options(no_flowsim PRIVATE -O3)
+target_link_libraries(no_flowsim PRIVATE
+    "${TORCH_ROOT}/lib/libtorch.so"
+    "${TORCH_ROOT}/lib/libtorch_cpu.so"
+    "${TORCH_ROOT}/lib/libtorch_cuda.so"
+    "${TORCH_ROOT}/lib/libc10.so")
+set_target_properties(no_flowsim PROPERTIES BUILD_RPATH "${TORCH_ROOT}/lib")

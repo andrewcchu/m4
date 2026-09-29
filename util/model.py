@@ -4,6 +4,8 @@ import torch.nn as nn
 import numpy as np
 import logging
 import os
+import json
+from time import perf_counter
 from torch_geometric.nn import SAGEConv
 
 
@@ -119,7 +121,6 @@ class FlowSimLstm(LightningModule):
         self.enable_log_norm = enable_log_norm
         self.loss_efficiency_size = 0.005
         self.loss_efficiency_queue = 0.005
-        self.n_links = 96
         logging.info(
             f"enable_link_state={enable_link_state}, enable_remainsize={enable_remainsize}, enable_queuelen={enable_queuelen}"
         )
@@ -218,8 +219,9 @@ class FlowSimLstm(LightningModule):
         batch_h_state[:, 2] = x[:, 0]  # remain size
         batch_h_state[:, 3] = x[:, 2]  # # of links
 
+        n_links_total = batch_index_link.numel()
         batch_h_state_link = torch.zeros(
-            (batch_size * self.n_links, self.hidden_size), device=x.device
+            (n_links_total, self.hidden_size), device=x.device
         )
         batch_h_state_link[:, 1] = 1.0
         batch_h_state_link[:, 2] = 1.0  # const for link bandwidth
@@ -234,7 +236,7 @@ class FlowSimLstm(LightningModule):
                 
         if self.enable_queuelen:
             loss_queue = torch.zeros(
-                (batch_size * self.n_links, 1), device=x.device
+                (n_links_total, 1), device=x.device
             )
             loss_queue_num = torch.ones_like(loss_queue)
             if enable_test:
@@ -439,6 +441,11 @@ class FlowSimLstm(LightningModule):
             ) = batch
         enable_test = tag == "test"
 
+        if enable_test:
+            if input.is_cuda:
+                torch.cuda.synchronize(input.device)
+            forward_started = perf_counter()
+
         estimated, loss_size, loss_queue, res_size, res_queue, size_info = self(
             input,
             batch_index,
@@ -452,6 +459,19 @@ class FlowSimLstm(LightningModule):
             edges_a_to_b_weight=edges_a_to_b_weight,
             enable_test=enable_test,
         )
+
+        if enable_test:
+            if input.is_cuda:
+                torch.cuda.synchronize(input.device)
+            forward_s = perf_counter() - forward_started
+            os.makedirs(self.save_dir, exist_ok=True)
+            with open(f"{self.save_dir}/model_forward_times.jsonl", "a") as timing_file:
+                timing_file.write(json.dumps({
+                    "specs": list(spec),
+                    "n_flows": int(input.shape[0]),
+                    "n_events": int(time_delta_matrix.shape[1]),
+                    "forward_s": forward_s,
+                }) + "\n")
 
         est = torch.div(estimated, output).squeeze()
         gt = torch.ones_like(est)
@@ -493,7 +513,7 @@ class FlowSimLstm(LightningModule):
             loss_tag,
             loss,
             sync_dist=self.enable_dist,
-            on_step=True,
+            on_step=tag == "train",
             on_epoch=True,
             logger=True,
             prog_bar=True,
