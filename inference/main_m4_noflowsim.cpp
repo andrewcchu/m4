@@ -5,13 +5,20 @@
 #include <filesystem>
 #include <torch/torch.h>
 #include <torch/script.h>
-#include <ryml_std.hpp>
-#include <ryml.hpp>
-#include "Topology.h"
-#include "TopologyBuilder.h"
+#include <torch/cuda.h>
 #include "Type.h"
+#include <fstream>
+#include <iostream>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <cmath>
+#include <cstdlib>
 
 #include <iomanip>
+#include <algorithm>
+#include <ATen/Context.h>
+#include <unordered_map>
 
 
 // flowsim parameters
@@ -48,8 +55,7 @@ auto options_int64 = torch::TensorOptions().dtype(torch::kInt64);
 
 
 // m4 model
-int gpu_id = 0;
-torch::Device device(torch::kCUDA, gpu_id);
+torch::Device device(torch::kCPU);
 
 static torch::jit::script::Module lstmcell_time;
 static torch::jit::script::Module lstmcell_rate;
@@ -109,16 +115,33 @@ int min_idx;
 
 float flow_arrival_time;
 float flow_completion_time;
+float raw_flow_completion_time;
+uint64_t completion_time_clamps;
+float max_completion_backtrack_ns;
+static constexpr const char* event_time_policy = "completion_not_before_current_time_v1";
+static constexpr const char* execution_policy = "deterministic_algorithms_cublas_4096_8_v1";
+static constexpr const char* cublas_workspace_config = ":4096:8";
+
+static void configure_execution() {
+    // Set this before CUDA initialization or the first cuBLAS handle. GNN
+    // scatter sums otherwise vary across prefix replays on CUDA, and small
+    // state differences can alter the subsequent event order.
+    if (::setenv("CUBLAS_WORKSPACE_CONFIG", cublas_workspace_config, 1) != 0)
+        throw std::runtime_error("cannot configure deterministic cuBLAS workspace");
+    at::globalContext().setDeterministicAlgorithms(true, false);
+    at::globalContext().setDeterministicCuDNN(true);
+    at::globalContext().setBenchmarkCuDNN(false);
+    at::globalContext().setAllowTF32CuBLAS(false);
+    at::globalContext().setAllowTF32CuDNN(false);
+}
 
 int get_tor(int flow_id) {
     return host_ids.at(flow_id) / num_per_tor;
 }
 
-void setup_m4(torch::Device device) {
-    if (!torch::cuda::is_available()) {
-        std::cerr << "[ERROR] CUDA is not available!" << std::endl;
-        return;
-    }
+void setup_m4(const std::string& model_dir) {
+    if (device.is_cuda() && !torch::cuda::is_available())
+        throw std::runtime_error("CUDA device requested but CUDA is unavailable");
 
     // Disable gradient calculations
     torch::NoGradGuard no_grad;
@@ -126,7 +149,6 @@ void setup_m4(torch::Device device) {
     // Load models
     static bool models_loaded = false;
     if (!models_loaded) {
-        const std::string model_dir = "/data1/zabreyko/m4/checkpoints";
         try {
             lstmcell_time = torch::jit::load(model_dir + "/lstmcell_time.pt", device);
             lstmcell_rate = torch::jit::load(model_dir + "/lstmcell_rate.pt", device);
@@ -138,8 +160,7 @@ void setup_m4(torch::Device device) {
             gnn_layer_2 = torch::jit::load(model_dir + "/gnn_layer_2.pt", device);
         }
         catch (const c10::Error& e) {
-            std::cerr << "[ERROR] Failed to load one or more models: " << e.what() << std::endl;
-            return;
+            throw std::runtime_error(std::string("failed to load TorchScript modules: ") + e.what());
         }
 
         // Set models to evaluation mode
@@ -177,18 +198,18 @@ void setup_m4_tensors(torch::Device device, int32_t n_edges, int32_t n_links, in
 
     fat_tensor = torch::from_blob(fat.data(), {n_flows}, options_int64).to(torch::kFloat32).to(device);
     i_fct_tensor = torch::from_blob(fct_i.data(), {n_flows}, options_int64).to(torch::kFloat32).to(device);
-    params_tensor = torch::from_blob(params.data(), {13}, options_double).to(torch::kFloat32).to(device);
+    params_tensor = torch::from_blob(params.data(), {n_flows, 13}, options_double).to(torch::kFloat32).to(device);
 
     //fid_tensor = torch::from_blob(fid.data(), {n_flows}, options_int64).to(device);
 
     // Convert flowid_to_linkid to tensors
-    flowid_to_linkid_flat_tensor = torch::from_blob(flowid_to_linkid_flat.data(), {n_edges}, options_int32).to(device);
+    flowid_to_linkid_flat_tensor = torch::from_blob(flowid_to_linkid_flat.data(), {n_edges}, options_int32).to(torch::kInt64).to(device);
     flowid_to_linkid_offsets_tensor = torch::from_blob(flowid_to_linkid_offsets.data(), {n_flows + 1}, options_int32).to(device);
     flowid_to_nlinks_tensor = flowid_to_linkid_offsets_tensor.slice(0, 1, n_flows+1) - flowid_to_linkid_offsets_tensor.slice(0, 0, n_flows);
     
     // Convert edges_flow_ids and edges_link_ids to tensors
-    edges_flow_ids_tensor = torch::from_blob(edges_flow_ids.data(), {n_edges}, options_int32).to(device);
-    edges_link_ids_tensor = torch::from_blob(edges_link_ids.data(), {n_edges}, options_int32).to(device);
+    edges_flow_ids_tensor = torch::from_blob(edges_flow_ids.data(), {n_edges}, options_int32).to(torch::kInt64).to(device);
+    edges_link_ids_tensor = torch::from_blob(edges_link_ids.data(), {n_edges}, options_int32).to(torch::kInt64).to(device);
 
     // Construct edge_index tensor [2, 2 * n_edges] for bidirectional edges
     edge_index = torch::stack({edges_flow_ids_tensor, edges_link_ids_tensor}, 0); // [2, n_edges]
@@ -231,6 +252,8 @@ void setup_m4_tensors(torch::Device device, int32_t n_edges, int32_t n_links, in
     time_clock = 0.0f;
     completed_flow_id = -1; // Initialize with invalid ID
     min_idx = -1;
+    completion_time_clamps = 0;
+    max_completion_backtrack_ns = 0.0f;
 
     ones_cache = torch::ones({n_links}, options_int32).to(device);
 }
@@ -253,24 +276,19 @@ void update_times_m4() {
         for (int i = 0; i < num_tors; i++) {
             queue_size += tor_queue[i].size();
         }
-        std::cout << "waiting in queue " << queue_size << " " << flow_queue.size() << "\n";
         if (!flow_queue.empty()) {
-            std::cout << "flow queue " << flow_queue.front() << "\n";
             flow_id_in_prop = flow_queue.front();
             flow_arrival_time = fat_tensor[flow_id_in_prop].item<float>() < time_clock ? time_clock : fat_tensor[flow_id_in_prop].item<float>();
             queued = true;
         }
         else {
-            std::cout << "checking flow\n";
             while (current_flow < n_flows) {
                 int tor = get_tor(current_flow);
                 if (flow_counts[tor] < flow_limit) {
-                    std::cout << "taking flow " << current_flow << "\n";
                     flow_id_in_prop = current_flow;
                     flow_arrival_time = fat_tensor[current_flow].item<float>();
                     break;
                 } else {
-                    std::cout << "pushing flow " << current_flow << " " << " " << host_ids.at(current_flow) << " " << get_tor(current_flow) << " " << tor_queue[get_tor(current_flow)].size() << "\n";
                     tor_queue[get_tor(current_flow)].push(current_flow);
                     current_flow++;
                 }
@@ -279,14 +297,14 @@ void update_times_m4() {
         }
     }
     flow_completion_time = std::numeric_limits<float>::infinity();
+    raw_flow_completion_time = flow_completion_time;
 
     if (n_flows_active > 0) {
         // Get indices of active flows
         auto flowid_active_indices = torch::nonzero(flowid_active_mask).flatten();
         auto h_vec_active = h_vec.index_select(0, flowid_active_indices);
-        auto nlinks_cur = flowid_to_nlinks_tensor.index_select(0, flowid_active_indices).unsqueeze(1); // [n_active,1]
-        auto params_data_cur = params_tensor.repeat({n_flows_active, 1});
-        std::cout << nlinks_cur.size(0) << " " << params_data_cur.size(0) << " " << h_vec_active.size(0) << "\n";
+        auto nlinks_cur = flowid_to_nlinks_tensor.index_select(0, flowid_active_indices).unsqueeze(1).to(torch::kFloat32); // [n_active,1]
+        auto params_data_cur = params_tensor.index_select(0, flowid_active_indices);
         auto input_tensor = torch::cat({nlinks_cur, params_data_cur, h_vec_active}, 1);
 
         // Perform inference
@@ -297,7 +315,13 @@ void update_times_m4() {
 
         // Find the flow with the minimum estimated completion time
         min_idx = torch::argmin(fct_stamp_est).item<int>();
-        flow_completion_time = fct_stamp_est[min_idx].item<float>();
+        raw_flow_completion_time = fct_stamp_est[min_idx].item<float>();
+        if (!std::isfinite(raw_flow_completion_time))
+            throw std::runtime_error("nonfinite completion prediction");
+        // FCT is predicted from release, and a new state can shorten it below
+        // elapsed time. Process that completion now; never rewind the clock.
+        // Keep the raw argmin ordering when several predictions are overdue.
+        flow_completion_time = std::max(time_clock, raw_flow_completion_time);
         completed_flow_id = flowid_active_indices[min_idx].item<int>();
     }
 }
@@ -309,10 +333,9 @@ void step_m4() {
     auto options_float = torch::TensorOptions().dtype(torch::kFloat32);
     
     // Decide whether the next event is a flow arrival or completion
-    if (flow_arrival_time < flow_completion_time) {
+    if (flow_arrival_time <= flow_completion_time) {
         // New flow arrives before the next completion
 
-        std::cout << flow_id_in_prop << " arrived\n";
 
         if (queued) {
             flow_queue.pop();
@@ -383,6 +406,11 @@ void step_m4() {
     }
     else {
         // Flow completes before the next arrival
+        if (raw_flow_completion_time < time_clock) {
+            ++completion_time_clamps;
+            max_completion_backtrack_ns = std::max(
+                max_completion_backtrack_ns, time_clock - raw_flow_completion_time);
+        }
         time_clock = flow_completion_time;
         // Actual FCT and SLDN
         res_fct_tensor[completed_flow_id][0] = flow_completion_time - release_time_tensor[completed_flow_id].item<float>();
@@ -395,11 +423,9 @@ void step_m4() {
         n_flows_completed++;
         flow_counts[get_tor(completed_flow_id)] -= 1;
         if (!tor_queue[get_tor(completed_flow_id)].empty()) {
-            std::cout << "tor push " << completed_flow_id << " " << get_tor(completed_flow_id) << " " << tor_queue[get_tor(completed_flow_id)].front() << "\n";
             flow_queue.push(tor_queue[get_tor(completed_flow_id)].front());
             tor_queue[get_tor(completed_flow_id)].pop();
         }
-        std::cout << "m4: flow completed " << completed_flow_id <<  " " << get_tor(completed_flow_id) << "\n";
 
         // Get graph ID of the completed flow
         graph_id_cur = flow_to_graph_id[completed_flow_id].item<int64_t>();
@@ -432,8 +458,6 @@ void step_m4() {
     // Update h_vec for active flows
     auto flowid_active_mask_cur = torch::logical_and(flowid_active_mask, flow_to_graph_id == graph_id_cur);
     auto flowid_active_list_cur = torch::nonzero(flowid_active_mask_cur).flatten();
-    std::cout << "actual var: " << n_flows_active << ", n_active_flows: "<<flowid_active_list_cur.numel()<< ", graph_id_cur: " << graph_id_cur<< ", fat: " << flow_arrival_time/1000.0 << ", fct: " << flow_completion_time/1000.0 << std::endl;
-    std::cout <<"m4: " << flow_to_graph_id[0].item<int32_t>() << "\n";
     if (flowid_active_list_cur.numel() > 0 && flow_arrival_time < flow_completion_time) {
         
         // Calculate time deltas for active flows
@@ -441,7 +465,7 @@ void step_m4() {
 
         // Create a mask for the edges corresponding to the active flows
         auto edge_mask = torch::isin(edge_index[0], flowid_active_list_cur);
-        auto selected_indices = edge_mask.nonzero().squeeze();
+        auto selected_indices = edge_mask.nonzero().flatten();
         auto edge_index_cur = edge_index.index_select(1, selected_indices);
 
         // Determine the number of active flows
@@ -482,7 +506,7 @@ void step_m4() {
         auto h_vec_rate_updated = gnn_output_2.slice(0,0,n_flows_active_cur);
         auto h_vec_rate_link = gnn_output_2.slice(0, n_flows_active_cur, gnn_output_2.size(0));
 
-        auto params_data = params_tensor.repeat({n_flows_active_cur, 1});
+        auto params_data = params_tensor.index_select(0, flowid_active_list_cur);
         h_vec_rate_updated = torch::cat({h_vec_rate_updated, params_data}, 1);
 
         h_vec_rate_updated = lstmcell_rate.forward({ h_vec_rate_updated, h_vec_time_updated }).toTensor();
@@ -502,159 +526,499 @@ void step_m4() {
 }
 
 
-int main(int argc, char *argv[]) {
-    const std::string scenario_path = argv[1];
-    const std::string fat_path = scenario_path + "/fat.npy";
-    const std::string fsize_path = scenario_path + "/fsize.npy";
-    const std::string topo_path = scenario_path + "/topology.txt";
-    const std::string routing_path = scenario_path + "/flow_to_path.txt";
-    const std::string fct_i_path = scenario_path + "/fct_i_topology_flows.npy";
-    const std::string flow_link_path = scenario_path + "/flow_to_links.txt";
-    //const std::string fid_path = scenario_path + "/fid_topology_flows.npy";
-    const std::string config_path = argv[2];
-    const std::string param_path = scenario_path + "/param_topology_flows.npy";
-    const std::string write_path = argv[3];
-    flow_limit = std::stoi(argv[4]);
-    std::string release_path;
-    if (argc == 6) {
-        release_path = argv[5];
-    }
 
-    for (uint32_t i = 0; i < num_tors; i++) {
-        flow_counts[i] = 0;
-    }
-
-    std::chrono::steady_clock::time_point time_start = std::chrono::steady_clock::now();
- 
-    npy::npy_data d_fat = npy::read_npy<int64_t>(fat_path);
-    std::vector<int64_t> arrival_times = d_fat.data;
-
-    npy::npy_data d_fsize = npy::read_npy<int64_t>(fsize_path);
-    std::vector<int64_t> flow_sizes = d_fsize.data;
-
-    //npy::npy_data d_fid = npy::read_npy<int64_t>(fid_path);
-    //fid = d_fid.data;
-
-    limit = arrival_times.size();
-    n_flows = arrival_times.size();
-
-    for (int i = 0; i < arrival_times.size() & i < limit; i++) {
-        int64_t flow_size = flow_sizes.at(i);
-        fat.push_back(arrival_times.at(i));
-        fsize.push_back(flow_size);
-    }
-
-    const double BYTES_PER_HEADER = 48;
-    const double MTU = 1000;
-    std::shared_ptr<Topology> topology = construct_fat_tree_topology(topo_path);
-
-    float latency = topology->get_latency();
-    float bandwidth = topology->get_bandwidth();
-
-    std::vector<Route> routing;
-    std::filesystem::path routing_fs = std::filesystem::current_path() / routing_path;
-    std::ifstream infile_routing(routing_fs);
-    int num_hops;
-    while (infile_routing >> num_hops) {
-        int host_id;
-        auto route = Route();
-        infile_routing >> host_id;
-        host_ids.push_back(host_id);
-        route.push_back(topology->get_device(host_id));
-        for (int i = 1; i < num_hops; i++) {
-            infile_routing >> host_id;
-            route.push_back(topology->get_device(host_id));
-        }
-        routing.push_back(route);
-    }
-
-    for (int i = 0; i < fat.size(); i++) {
-        double prop_delay = latency * (routing.at(i).size() - 1);
-        double trans_delay = (((fsize.at(i) + std::ceil(fsize.at(i) / MTU) * BYTES_PER_HEADER)) / bandwidth);
-        double first_packet = (std::min(MTU, (double) fsize.at(i)) + BYTES_PER_HEADER) / bandwidth * (routing.at(i).size() - 2);
-        fct_i.push_back(trans_delay + prop_delay + first_packet);
-    }
-
-    npy::npy_data d_param = npy::read_npy<double>(param_path);
-    params = d_param.data;
-
-    std::filesystem::path cwd = std::filesystem::current_path() / flow_link_path;
-    std::ifstream infile(cwd);
-    int num_links;
-    int32_t offset = 0;
-    int32_t flow_id = 0;
-    while (infile >> num_links) {
-        std::vector<int> hops;
-        flowid_to_linkid_offsets.push_back(offset);
-        for (int i = 0; i < num_links; i++) {
-            int32_t link;
-            infile >> link;
-            flowid_to_linkid_flat.push_back(link);
-            offset++;
-
-            edges_flow_ids.push_back(flow_id);
-            edges_link_ids.push_back(link);
-        }
-        flow_id++;
-    }
-    flowid_to_linkid_offsets.push_back(offset);
-
-    uint32_t n_edges = flowid_to_linkid_flat.size();
-
-    infile.close();
-    infile.open(config_path);
-    std::ostringstream contents;
-    contents << infile.rdbuf();
-    std::string config_contents = contents.str();
-    ryml::Tree config = ryml::parse_in_place(ryml::to_substr(config_contents));
-    ryml::NodeRef hidden_size_node = config["model"]["hidden_size"];
-    int32_t hidden_size;
-    hidden_size_node >> hidden_size;
-    ryml::NodeRef n_links_node = config["dataset"]["n_links_max"];
-    int32_t n_links;
-    n_links_node >> n_links;
-
-    std::cout << "setting up m4\n";
-
-    setup_m4(device);
-    setup_m4_tensors(device, n_edges, n_links, hidden_size);
-
-    int flow_index = 0;
-    int flows_completed = 0;
-    while (n_flows_arrived < n_flows || n_flows_completed < n_flows) {
-        std::cout << "provoking " << n_flows_arrived << " " << n_flows_completed << "\n";
-        update_times_m4();
-        step_m4();
-    }
-
-    std::vector<float> fct_vector;
-    for (int i = 0; i < res_fct_tensor.sizes()[0]; i++) {
-        fct_vector.push_back(res_fct_tensor[i][0].item<float>());
-    }
-
-    npy::npy_data<float> d;
-    d.data = fct_vector;
-    d.shape = {limit};
-    d.fortran_order = false;
-    npy::write_npy(write_path, d);
-
-    if (argc == 6) {
-        std::vector<float> release_times;
-        for (int i = 0; i < limit; i++) {
-            release_times.push_back(release_time_tensor[i].item<float>());
-        }
-
-        npy::npy_data<float> d_release;
-        d_release.data = release_times;
-        d_release.shape = {limit};
-        d_release.fortran_order = false;
-        npy::write_npy(release_path, d_release);
-    }
-
-    std::chrono::steady_clock::time_point time_end = std::chrono::steady_clock::now();
-    std::cout << std::chrono::duration_cast<std::chrono::seconds>(time_end - time_start).count() << " seconds\n";
-
-    //torch::cuda::synchronize();
-    //torch::cuda::emptyCache();
+static void sync_device() {
+    if (device.is_cuda()) torch::cuda::synchronize(device.index());
 }
 
+static std::vector<int> route_line(const std::string& line) {
+    std::istringstream input(line);
+    std::vector<int> values;
+    int value;
+    while (input >> value) values.push_back(value);
+    if (!input.eof() || values.empty() || values[0] < 1 ||
+        static_cast<size_t>(values[0]) != values.size() - 1)
+        throw std::runtime_error("malformed route row: " + line);
+    return values;
+}
+
+struct ScenarioInput {
+    std::vector<int64_t> fat, fsize, fct_i;
+    std::vector<double> params;
+    std::vector<int> host_ids;
+    std::vector<int32_t> flat, offsets, edge_flows, edge_links;
+    int n_links;
+};
+
+static ScenarioInput read_scenario(const std::filesystem::path& scenario) {
+    ScenarioInput input;
+    auto d_fat = npy::read_npy<int64_t>((scenario / "fat.npy").string());
+    auto d_size = npy::read_npy<int64_t>((scenario / "fsize.npy").string());
+    auto d_ideal = npy::read_npy<int64_t>((scenario / "fct_i_topology_flows.npy").string());
+    auto d_fid = npy::read_npy<int32_t>((scenario / "fid_topology_flows.npy").string());
+    input.fat = d_fat.data; input.fsize = d_size.data; input.fct_i = d_ideal.data;
+    const int count = static_cast<int>(input.fat.size());
+    if (count < 1 || d_fat.shape.size() != 1 || d_size.shape != d_fat.shape ||
+        d_ideal.shape != d_fat.shape || d_fid.shape != d_fat.shape)
+        throw std::runtime_error("flow arrays have different or invalid shapes");
+    for (int i = 0; i < count; ++i) {
+        if (d_fid.data[i] != i || input.fsize[i] <= 0 || input.fct_i[i] <= 0 ||
+            (i && input.fat[i] < input.fat[i - 1]))
+            throw std::runtime_error("invalid flow ID, size, ideal FCT, or arrival order");
+    }
+    auto d_param = npy::read_npy<double>((scenario / "param_topology_flows.npy").string());
+    input.params = d_param.data;
+    if (d_param.shape != npy::shape_t{static_cast<size_t>(count), 13})
+        throw std::runtime_error("parameters must have shape [n_flows, 13]");
+    for (double p : input.params) if (!std::isfinite(p)) throw std::runtime_error("nonfinite parameter");
+    std::ifstream topology(scenario / "topology.txt");
+    int nodes, switches, undirected_links;
+    if (!(topology >> nodes >> switches >> undirected_links) || nodes < 2 || undirected_links < 1)
+        throw std::runtime_error("invalid topology header");
+    input.n_links = 2 * undirected_links;
+    std::string line;
+    std::getline(topology, line);
+    if (!std::getline(topology, line)) throw std::runtime_error("missing topology switch list");
+    std::vector<std::pair<int, int>> endpoints(input.n_links);
+    for (int lid = 0; lid < undirected_links; ++lid) {
+        if (!std::getline(topology, line)) throw std::runtime_error("topology has too few link rows");
+        std::istringstream row(line);
+        int a, b; std::string rate, delay, error;
+        if (!(row >> a >> b >> rate >> delay >> error) || a < 0 || a >= nodes ||
+            b < 0 || b >= nodes || a == b)
+            throw std::runtime_error("malformed topology link row");
+        endpoints[2 * lid] = {a, b}; endpoints[2 * lid + 1] = {b, a};
+    }
+    std::ifstream node_routes(scenario / "flow_to_path.txt");
+    std::ifstream link_routes(scenario / "flow_to_links.txt");
+    if (!node_routes || !link_routes) throw std::runtime_error("missing native route file");
+    std::string node_line, link_line;
+    int32_t offset = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!std::getline(node_routes, node_line) || !std::getline(link_routes, link_line))
+            throw std::runtime_error("native route file has too few rows");
+        auto route = route_line(node_line), links = route_line(link_line);
+        if (route[0] != links[0] + 1 || route[1] < 0 || route.back() < 0 ||
+            route[1] >= nodes || route.back() >= nodes)
+            throw std::runtime_error("native node/link route length or endpoint invalid");
+        input.host_ids.push_back(route[1]); input.offsets.push_back(offset);
+        for (size_t j = 1; j < links.size(); ++j) {
+            if (links[j] < 0 || links[j] >= input.n_links ||
+                endpoints[links[j]] != std::make_pair(route[j], route[j + 1]))
+                throw std::runtime_error("native link route invalid");
+            input.flat.push_back(links[j]); input.edge_flows.push_back(i);
+            input.edge_links.push_back(links[j]); ++offset;
+        }
+    }
+    if (std::getline(node_routes, node_line) || std::getline(link_routes, link_line))
+        throw std::runtime_error("native route file has extra rows");
+    input.offsets.push_back(offset);
+    return input;
+}
+
+static void activate(const ScenarioInput& input) {
+    fat = input.fat; fsize = input.fsize; fct_i = input.fct_i; params = input.params;
+    host_ids = input.host_ids; flowid_to_linkid_flat = input.flat;
+    flowid_to_linkid_offsets = input.offsets; edges_flow_ids = input.edge_flows;
+    edges_link_ids = input.edge_links;
+    n_flows = static_cast<int32_t>(fat.size()); limit = fat.size();
+}
+
+struct RecurrentState {
+    torch::Tensor h, link, link_graph, link_count, flow_graph, last, active;
+    torch::Tensor release, fct, sldn;
+    int graph_counter, graph_current, current, arrived, completed, active_count;
+    float clock;
+    uint64_t completion_clamps;
+    float max_backtrack;
+    std::unordered_map<uint32_t, uint32_t> counts;
+    std::queue<uint32_t> queue;
+    std::unordered_map<uint32_t, std::queue<uint32_t>> tor_queues;
+};
+
+static RecurrentState save_state() {
+    return {h_vec.clone(), z_t_link.clone(), link_to_graph_id.clone(),
+            link_to_nflows.clone(), flow_to_graph_id.clone(), time_last.clone(),
+            flowid_active_mask.clone(), release_time_tensor.clone(),
+            res_fct_tensor.clone(), res_sldn_tensor.clone(), graph_id_counter,
+            graph_id_cur, current_flow, n_flows_arrived, n_flows_completed,
+            n_flows_active, time_clock, completion_time_clamps,
+            max_completion_backtrack_ns, flow_counts, flow_queue, tor_queue};
+}
+
+static void restore_state(const RecurrentState& s, int prefix_count) {
+    h_vec = s.h.clone(); z_t_link = s.link.clone();
+    link_to_graph_id = s.link_graph.clone(); link_to_nflows = s.link_count.clone();
+    flow_to_graph_id = s.flow_graph.clone(); time_last = s.last.clone();
+    flowid_active_mask = s.active.clone(); release_time_tensor = s.release.clone();
+    res_fct_tensor = s.fct.clone(); res_sldn_tensor = s.sldn.clone();
+    // Future-flow sizes are action-specific, including the hidden-state input.
+    if (prefix_count < n_flows)
+        h_vec.slice(0, prefix_count, n_flows).select(1, 2).copy_(
+            size_tensor.slice(0, prefix_count, n_flows));
+    graph_id_counter = s.graph_counter; graph_id_cur = s.graph_current;
+    current_flow = s.current; n_flows_arrived = s.arrived;
+    n_flows_completed = s.completed; n_flows_active = s.active_count;
+    time_clock = s.clock; flow_counts = s.counts; flow_queue = s.queue;
+    completion_time_clamps = s.completion_clamps;
+    max_completion_backtrack_ns = s.max_backtrack;
+    tor_queue = s.tor_queues; queued = false;
+}
+
+static void reset_engine(const ScenarioInput& input, int hidden_size) {
+    activate(input); flow_counts.clear();
+    while (!flow_queue.empty()) flow_queue.pop();
+    tor_queue.clear(); queued = false; flow_limit = 0;
+    setup_m4_tensors(device, static_cast<int32_t>(input.flat.size()),
+                     input.n_links, hidden_size);
+}
+
+static void step_checked(int& steps) {
+    if (++steps > 2 * n_flows + 8) throw std::runtime_error("rollout stalled: event limit exceeded");
+    update_times_m4();
+    if (!std::isfinite(flow_arrival_time) && !std::isfinite(flow_completion_time))
+        throw std::runtime_error("rollout stalled: no finite next event");
+    if (flow_completion_time < time_clock || flow_arrival_time < time_clock)
+        throw std::runtime_error("rollout stalled: event time moved backward");
+    step_m4();
+}
+
+static void replay_cutoff(int64_t cutoff_ns) {
+    int steps = 0;
+    while (n_flows_completed < n_flows) {
+        update_times_m4();
+        if (std::min(flow_arrival_time, flow_completion_time) >= static_cast<float>(cutoff_ns))
+            break;
+        if (!std::isfinite(flow_arrival_time) && !std::isfinite(flow_completion_time))
+            throw std::runtime_error("prefix stalled");
+        if (++steps > 2 * n_flows + 8) throw std::runtime_error("prefix event limit exceeded");
+        if (std::min(flow_arrival_time, flow_completion_time) < time_clock)
+            throw std::runtime_error("prefix event time moved backward");
+        step_m4();
+    }
+}
+
+static void complete_rollout() {
+    int steps = 0;
+    while (n_flows_completed < n_flows) step_checked(steps);
+}
+
+static std::vector<float> materialize() {
+    auto result = res_fct_tensor.select(1, 0).to(torch::kCPU).contiguous();
+    std::vector<float> values(result.data_ptr<float>(), result.data_ptr<float>() + n_flows);
+    for (float value : values)
+        if (!std::isfinite(value) || value <= 0)
+            throw std::runtime_error("rollout produced incomplete or nonfinite FCT");
+    return values;
+}
+
+static double seconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+struct ActionInput { std::string id; ScenarioInput data; };
+struct ArmSample {
+    double full_set_s = 0, shared_prefix_s = 0;
+    std::vector<double> per_action_prefix_s, continuation_s, single_s;
+    std::vector<std::vector<float>> predictions;
+    std::vector<uint64_t> completion_clamps;
+    std::vector<float> max_backtrack;
+};
+
+static ArmSample measure_arm(const std::vector<ActionInput>& actions, bool cached,
+                            int64_t cutoff_ns, int hidden_size) {
+    ArmSample sample;
+    sync_device();
+    const auto full_start = std::chrono::steady_clock::now();
+    RecurrentState prefix;
+    int prefix_count = 0;
+    if (cached) {
+        reset_engine(actions.front().data, hidden_size);
+        replay_cutoff(cutoff_ns);
+        prefix_count = current_flow;
+        prefix = save_state();
+        sync_device();
+        sample.shared_prefix_s = seconds_since(full_start);
+    }
+    for (const auto& action : actions) {
+        sync_device();
+        const auto action_start = std::chrono::steady_clock::now();
+        reset_engine(action.data, hidden_size);
+        if (cached) restore_state(prefix, prefix_count);
+        else replay_cutoff(cutoff_ns);
+        sync_device();
+        const double prefix_s = seconds_since(action_start);
+        const auto continuation_start = std::chrono::steady_clock::now();
+        complete_rollout();
+        auto prediction = materialize();
+        sync_device();
+        const double continuation_s = seconds_since(continuation_start);
+        sample.per_action_prefix_s.push_back(prefix_s);
+        sample.continuation_s.push_back(continuation_s);
+        sample.single_s.push_back(prefix_s + continuation_s);
+        sample.predictions.push_back(std::move(prediction));
+        sample.completion_clamps.push_back(completion_time_clamps);
+        sample.max_backtrack.push_back(max_completion_backtrack_ns);
+    }
+    sync_device();
+    sample.full_set_s = seconds_since(full_start);
+    return sample;
+}
+
+static void write_numbers(std::ostream& out, const std::vector<double>& values) {
+    out << '[';
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out << ',';
+        out << std::setprecision(12) << values[i];
+    }
+    out << ']';
+}
+
+static void verify_predictions(const std::vector<float>& reference,
+                               const std::vector<float>& observed,
+                               const std::string& phase, const std::string& action,
+                               const std::filesystem::path& out_dir) {
+    if (reference.size() != observed.size())
+        throw std::runtime_error(phase + " coverage mismatch: " + action);
+    size_t first = reference.size();
+    double max_error = 0.0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double error = std::abs(observed[i] - reference[i]);
+        max_error = std::max(max_error, error);
+        if (error > std::max(16.0f, 1e-5f * std::abs(reference[i])) && first == reference.size())
+            first = i;
+    }
+    if (first == reference.size()) return;
+    std::filesystem::create_directories(out_dir);
+    const auto diagnostic_path = out_dir / "parity_failure.json";
+    std::ofstream diagnostic(diagnostic_path);
+    if (!diagnostic) throw std::runtime_error("cannot write native parity diagnostics");
+    const float tolerance = std::max(16.0f, 1e-5f * std::abs(reference[first]));
+    diagnostic << std::setprecision(12)
+               << "{\"phase\":\"" << phase << "\",\"action\":\"" << action
+               << "\",\"flow_index\":" << first << ",\"n_flows\":" << reference.size()
+               << ",\"reference_fct_ns\":" << reference[first]
+               << ",\"observed_fct_ns\":" << observed[first]
+               << ",\"absolute_error_ns\":" << std::abs(observed[first] - reference[first])
+               << ",\"tolerance_ns\":" << tolerance << ",\"max_absolute_error_ns\":" << max_error
+               << ",\"execution_policy\":\"" << execution_policy
+               << "\",\"event_time_policy\":\"" << event_time_policy
+               << "\",\"deterministic_algorithms\":true,\"cublas_workspace_config\":\""
+               << cublas_workspace_config << "\"}\n";
+    for (const auto& side : {std::string("reference"), std::string("observed")}) {
+        npy::npy_data<float> array;
+        array.data = side == "reference" ? reference : observed;
+        array.shape = {array.data.size()}; array.fortran_order = false;
+        npy::write_npy((out_dir / ("parity_" + side + "_fct_ns.npy")).string(), array);
+    }
+    std::ostringstream error;
+    error << std::setprecision(12) << phase << " prediction mismatch: " << action
+          << "; flow_index=" << first << "; reference_fct_ns=" << reference[first]
+          << "; observed_fct_ns=" << observed[first] << "; tolerance_ns=" << tolerance
+          << "; diagnostics=" << diagnostic_path.string();
+    throw std::runtime_error(error.str());
+}
+
+static int matched_request(const std::unordered_map<std::string, std::string>& args) {
+    for (const auto& key : {"--models", "--request", "--output-dir", "--timings", "--device", "--repeats"})
+        if (!args.count(key)) throw std::runtime_error(std::string("missing ") + key);
+    const int repeats = std::stoi(args.at("--repeats"));
+    const int warmup = args.count("--warmup") ? std::stoi(args.at("--warmup")) : 1;
+    const int hidden_size = args.count("--hidden-size") ? std::stoi(args.at("--hidden-size")) : 200;
+    const int64_t cutoff_ns = args.count("--cutoff-ns") ? std::stoll(args.at("--cutoff-ns")) : 1500000;
+    if (repeats < 1 || warmup < 0 || hidden_size < 4 || cutoff_ns <= 0)
+        throw std::runtime_error("invalid matched request parameters");
+    device = torch::Device(args.at("--device"));
+    if (device.is_cuda() && torch::cuda::device_count() != 1)
+        throw std::runtime_error("matched benchmark requires exactly one GPU");
+    std::ifstream request(args.at("--request"));
+    if (!request) throw std::runtime_error("cannot open request list");
+    std::vector<ActionInput> actions;
+    std::string line;
+    while (std::getline(request, line)) {
+        const auto sep = line.find('\t');
+        if (sep == std::string::npos || line.find('\t', sep + 1) != std::string::npos)
+            throw std::runtime_error("malformed request row");
+        const auto id = line.substr(0, sep);
+        const auto path = line.substr(sep + 1);
+        if (path.empty()) throw std::runtime_error("empty scenario path");
+        if (id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != std::string::npos)
+            throw std::runtime_error("unsafe action ID");
+        for (const auto& action : actions) if (action.id == id) throw std::runtime_error("duplicate action ID");
+        actions.push_back({id, read_scenario(path)});
+    }
+    if (actions.empty() || actions.size() > 5) throw std::runtime_error("request needs one to five actions");
+    const auto& base = actions.front().data;
+    const int prefix_count = std::lower_bound(base.fat.begin(), base.fat.end(), cutoff_ns) - base.fat.begin();
+    for (const auto& action : actions) {
+        const auto& x = action.data;
+        if (x.n_links != base.n_links || x.fat.size() != base.fat.size() ||
+            x.host_ids != base.host_ids || x.flat != base.flat || x.offsets != base.offsets ||
+            x.edge_flows != base.edge_flows || x.edge_links != base.edge_links ||
+            !std::equal(x.fat.begin(), x.fat.begin() + prefix_count, base.fat.begin()) ||
+            !std::equal(x.fsize.begin(), x.fsize.begin() + prefix_count, base.fsize.begin()) ||
+            !std::equal(x.fct_i.begin(), x.fct_i.begin() + prefix_count, base.fct_i.begin()) ||
+            !std::equal(x.params.begin(), x.params.begin() + 13 * prefix_count, base.params.begin()) ||
+            (prefix_count < static_cast<int>(x.fat.size()) && x.fat[prefix_count] < cutoff_ns))
+            throw std::runtime_error("actions differ before cutoff or in route/flow order");
+    }
+    setup_m4(args.at("--models"));
+    std::vector<ArmSample> cached_samples, uncached_samples;
+    for (int rep = -warmup; rep < repeats; ++rep) {
+        auto cached = measure_arm(actions, true, cutoff_ns, hidden_size);
+        auto uncached = measure_arm(actions, false, cutoff_ns, hidden_size);
+        for (size_t i = 0; i < actions.size(); ++i) {
+            auto single = measure_arm({actions[i]}, true, cutoff_ns, hidden_size);
+            cached.single_s[i] = single.full_set_s;
+            const auto& a = single.predictions.front();
+            const auto& b = cached.predictions[i];
+            verify_predictions(b, a, "single-request", actions[i].id, args.at("--output-dir"));
+        }
+        for (size_t i = 0; i < actions.size(); ++i) {
+            const auto& a = cached.predictions[i]; const auto& b = uncached.predictions[i];
+            verify_predictions(b, a, "cached/uncached", actions[i].id, args.at("--output-dir"));
+        }
+        if (rep >= 0) {
+            cached_samples.push_back(std::move(cached));
+            uncached_samples.push_back(std::move(uncached));
+        }
+    }
+    const auto out_dir = std::filesystem::path(args.at("--output-dir"));
+    std::filesystem::create_directories(out_dir);
+    for (size_t i = 0; i < actions.size(); ++i) {
+        for (const auto& arm : {std::string("cached"), std::string("uncached")}) {
+            const auto& prediction = (arm == "cached" ? cached_samples : uncached_samples).back().predictions[i];
+            npy::npy_data<float> output;
+            output.data = prediction; output.shape = {prediction.size()}; output.fortran_order = false;
+            npy::write_npy((out_dir / (arm + "__" + actions[i].id + ".npy")).string(), output);
+        }
+    }
+    std::ofstream timings(args.at("--timings"));
+    if (!timings) throw std::runtime_error("cannot open matched timings output");
+    timings << "{\"unit\":\"nanoseconds\",\"precision\":\"fp32_tf32_off\",\"device\":\""
+            << args.at("--device") << "\",\"cutoff_ns\":" << cutoff_ns
+            << ",\"event_time_policy\":\"" << event_time_policy << "\""
+            << ",\"execution_policy\":\"" << execution_policy
+            << "\",\"deterministic_algorithms\":true,\"cublas_workspace_config\":\""
+            << cublas_workspace_config << "\""
+            << ",\"n_flows\":" << base.fat.size() << ",\"prefix_flows\":" << prefix_count
+            << ",\"cached_uncached_parity\":true,\"warmup\":" << warmup
+            << ",\"repeats\":" << repeats << ",\"arms\":{";
+    for (const auto& arm : {std::string("cached"), std::string("uncached")}) {
+        if (arm == "uncached") timings << ',';
+        const auto& samples = arm == "cached" ? cached_samples : uncached_samples;
+        timings << '\"' << arm << "\":{\"full_set_s\":";
+        std::vector<double> values;
+        for (const auto& s : samples) values.push_back(s.full_set_s);
+        write_numbers(timings, values); values.clear();
+        timings << ",\"shared_prefix_s\":";
+        for (const auto& s : samples) values.push_back(s.shared_prefix_s);
+        write_numbers(timings, values);
+        timings << ",\"actions\":{";
+        for (size_t i = 0; i < actions.size(); ++i) {
+            if (i) timings << ',';
+            timings << '\"' << actions[i].id << "\":{";
+            for (const auto& field : {std::string("per_action_prefix_s"), std::string("continuation_s"), std::string("single_s")}) {
+                if (field != "per_action_prefix_s") timings << ',';
+                timings << '\"' << field << "\":"; values.clear();
+                for (const auto& s : samples) values.push_back(
+                    field == "per_action_prefix_s" ? s.per_action_prefix_s[i] :
+                    field == "continuation_s" ? s.continuation_s[i] : s.single_s[i]);
+                write_numbers(timings, values);
+            }
+            timings << ",\"completion_time_clamps\":"; values.clear();
+            for (const auto& s : samples) values.push_back(s.completion_clamps[i]);
+            write_numbers(timings, values);
+            timings << ",\"max_completion_backtrack_ns\":"; values.clear();
+            for (const auto& s : samples) values.push_back(s.max_backtrack[i]);
+            write_numbers(timings, values);
+            timings << '}';
+        }
+        timings << "}}";
+    }
+    timings << "}}\n";
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+  try {
+    configure_execution();
+    std::unordered_map<std::string, std::string> args;
+    if (argc < 3 || argc % 2 == 0)
+        throw std::runtime_error("usage: no_flowsim --models DIR --scenario DIR ... | --request FILE --output-dir DIR ...");
+    for (int i = 1; i < argc; i += 2) args[argv[i]] = argv[i + 1];
+    if (args.count("--request")) return matched_request(args);
+    for (const auto& key : {"--models", "--scenario", "--output", "--device", "--timings", "--repeats"})
+        if (!args.count(key)) throw std::runtime_error(std::string("missing ") + key);
+    device = torch::Device(args.at("--device"));
+    const int repeats = std::stoi(args.at("--repeats"));
+    const int hidden_size = args.count("--hidden-size") ? std::stoi(args.at("--hidden-size")) : 200;
+    if (repeats < 1 || hidden_size < 4) throw std::runtime_error("invalid repeats or hidden size");
+    auto input = read_scenario(args.at("--scenario"));
+    activate(input);
+    const int n_links = input.n_links;
+    const int32_t offset = static_cast<int32_t>(input.flat.size());
+    flow_limit = 0;
+    setup_m4(args.at("--models"));
+    std::vector<double> rollout_seconds, warm_wall_seconds, completion_clamps, max_backtrack;
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        flow_counts.clear();
+        while (!flow_queue.empty()) flow_queue.pop();
+        tor_queue.clear();
+        queued = false;
+        setup_m4_tensors(device, offset, n_links, hidden_size);
+        sync_device();
+        auto started = std::chrono::steady_clock::now();
+        for (int steps = 0; n_flows_completed < n_flows; ++steps) {
+            if (steps > 2 * n_flows + 8) throw std::runtime_error("rollout stalled: event limit exceeded");
+            update_times_m4();
+            if (!std::isfinite(flow_arrival_time) && !std::isfinite(flow_completion_time))
+                throw std::runtime_error("rollout stalled: no finite next event");
+            if (flow_completion_time < time_clock || flow_arrival_time < time_clock)
+                throw std::runtime_error("rollout stalled: event time moved backward");
+            step_m4();
+        }
+        auto finished = std::chrono::steady_clock::now();
+        warm_wall_seconds.push_back(std::chrono::duration<double>(finished - started).count());
+        sync_device();
+        rollout_seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        completion_clamps.push_back(completion_time_clamps);
+        max_backtrack.push_back(max_completion_backtrack_ns);
+    }
+    auto result = res_fct_tensor.select(1, 0).to(torch::kCPU).contiguous();
+    std::vector<float> values(result.data_ptr<float>(), result.data_ptr<float>() + n_flows);
+    for (float value : values)
+        if (!std::isfinite(value) || value <= 0)
+            throw std::runtime_error("rollout produced incomplete or nonfinite FCT");
+    npy::npy_data<float> output;
+    output.data = values; output.shape = {static_cast<size_t>(n_flows)};
+    output.fortran_order = false;
+    npy::write_npy(args.at("--output"), output);
+    std::ofstream timings(args.at("--timings"));
+    if (!timings) throw std::runtime_error("cannot open timing output");
+    timings << "{\"unit\":\"nanoseconds\",\"device\":\"" << args.at("--device")
+            << "\",\"execution_policy\":\"" << execution_policy
+            << "\",\"deterministic_algorithms\":true,\"cublas_workspace_config\":\""
+            << cublas_workspace_config
+            << "\",\"event_time_policy\":\"" << event_time_policy
+            << "\",\"n_flows\":" << n_flows << ",\"warm_wall_s\":[";
+    for (size_t i = 0; i < warm_wall_seconds.size(); ++i) {
+        if (i) timings << ',';
+        timings << std::setprecision(12) << warm_wall_seconds[i];
+    }
+    timings << "],\"gpu_sync_rollout_s\":[";
+    for (size_t i = 0; i < rollout_seconds.size(); ++i) {
+        if (i) timings << ',';
+        timings << std::setprecision(12) << rollout_seconds[i];
+    }
+    timings << "],\"completion_time_clamps\":";
+    write_numbers(timings, completion_clamps);
+    timings << ",\"max_completion_backtrack_ns\":";
+    write_numbers(timings, max_backtrack);
+    timings << "}\n";
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "no_flowsim: " << error.what() << '\n';
+    return 1;
+  }
+}

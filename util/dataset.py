@@ -130,6 +130,8 @@ class DataModulePerFlow(LightningDataModule):
         test_on_train=False,
         test_on_empirical=False,
         test_on_manual=False,
+        dir_validation=None,
+        dir_test=None,
     ) -> None:
         """
         Initializes a new instance of the class with the specified parameters.
@@ -143,6 +145,8 @@ class DataModulePerFlow(LightningDataModule):
         self.num_workers = num_workers
         self.train_frac = train_frac
         self.dir_input = dir_input
+        self.dir_validation = dir_validation
+        self.dir_test = dir_test
         self.dir_output = dir_output
         self.lr = lr
         self.topo_type = topo_type
@@ -303,10 +307,13 @@ class DataModulePerFlow(LightningDataModule):
             None
         """
         if stage == "fit":
-            self.train_list, self.val_list = self.__random_split_list(
-                self.data_list,
-                self.train_frac,
-            )
+            if self.dir_validation:
+                self.train_list = self.data_list
+                self.val_list = self.__fixed_root_list(self.dir_validation)
+            else:
+                self.train_list, self.val_list = self.__random_split_list(
+                    self.data_list, self.train_frac,
+                )
             num_train, num_val = (
                 len(self.train_list),
                 len(self.val_list),
@@ -322,6 +329,9 @@ class DataModulePerFlow(LightningDataModule):
             self.__dump_data_list(self.dir_output)
 
         if stage == "test":
+            if self.dir_test:
+                self.test = self.__create_dataset(self.__fixed_root_list(self.dir_test))
+                return
             if self.test_on_manual or self.test_on_empirical:
                 data_list_test = []
 
@@ -538,6 +548,22 @@ class DataModulePerFlow(LightningDataModule):
 
         return train_part, test_part
 
+    def __fixed_root_list(self, root):
+        result = []
+        for spec in sorted(os.listdir(root)):
+            scenario = os.path.join(root, spec, "ns3")
+            if not os.path.isdir(scenario):
+                continue
+            periods = np.load(
+                f"{scenario}/period{self.topo_type}_t{self.flow_size_threshold}.npy",
+                allow_pickle=True,
+            )
+            result.extend((scenario, self.topo_type, i, len(period))
+                          for i, period in enumerate(periods))
+        if not result:
+            raise ValueError(f"no m4 periods in fixed split root {root}")
+        return result
+
     def __create_dataset(
         self,
         data_list,
@@ -593,7 +619,6 @@ class TopoFctSldnSegment(Dataset):
         self.enable_remainsize = enable_remainsize
         self.enable_queuelen = enable_queuelen
         self.enable_testbed = enable_testbed
-        self.n_links = 96
         logging.info(
             f"call TopoFctSldnSegment. data_list={len(data_list)}, enable_positional_encoding={enable_positional_encoding}, flow_size_threshold={flow_size_threshold}"
         )
@@ -605,7 +630,7 @@ class TopoFctSldnSegment(Dataset):
         spec, topo_type, segment_id, _ = self.data_list[idx]
         src_dst_pair_target_str = f"_seg{segment_id}"
 
-        dir_input_tmp = f"{self.dir_input}/{spec}"
+        dir_input_tmp = spec if os.path.isabs(spec) else f"{self.dir_input}/{spec}"
 
         busy_periods = np.load(
             f"{dir_input_tmp}/period{topo_type}_t{self.flow_size_threshold}.npy",
@@ -623,6 +648,7 @@ class TopoFctSldnSegment(Dataset):
             fats = np.load(f)[fid]
         with open(f"{dir_input_tmp}/flink.npy", "rb") as f:
             link_list = np.load(f)
+        n_links = len(link_list)
         link_dict = {link: idx for idx, link in enumerate(link_list)}
         link_info = np.load(
             f"{dir_input_tmp}/flow_to_path.npy",
@@ -721,13 +747,22 @@ class TopoFctSldnSegment(Dataset):
             remainsize_list = None
 
         output_data = np.divide(fcts, i_fcts).reshape(-1, 1).astype(np.float32)
-        assert (output_data >= 1.0).all()
+        # Integer-nanosecond ideal FCT can exceed the measured FCT by a few
+        # ticks due to rounding in the independent reporting paths.
+        if np.any(fcts + 16 < i_fcts):
+            raise ValueError("reported FCT is materially below ideal FCT")
+        output_data = np.maximum(output_data, 1.0)
         output_data[output_data>50]=1
         
         param_path = f"{dir_input_tmp}/param{topo_type}.npy"
         if os.path.exists(param_path):
             param_data = np.load(f"{dir_input_tmp}/param{topo_type}.npy")
-            param_data_repeat = np.repeat(param_data[:, np.newaxis], n_flows, axis=1).T
+            if param_data.shape == (13,):
+                param_data_repeat = np.repeat(param_data[None, :], n_flows, axis=0)
+            elif param_data.ndim == 2 and param_data.shape[1] == 13:
+                param_data_repeat = param_data[fid]
+            else:
+                raise ValueError(f"invalid m4 parameter shape: {param_data.shape}")
         else:
             param_data_repeat = np.zeros((n_flows, 13), dtype=np.float32)
             large_flow_mask = sizes >= 1000
@@ -767,7 +802,7 @@ class TopoFctSldnSegment(Dataset):
             flow_active_list,  # (n_flows,2)
             time_delta_list,  # (n_events,1)
             edge_index,  # (2, n_edges)
-            self.n_links,
+            n_links,
         )
 
     def compute_edge_index(self, link_info):

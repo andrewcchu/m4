@@ -85,6 +85,8 @@ if __name__ == "__main__":
             sampling_method=dataset_config.get("sampling_method", "uniform"),
             n_samples_sampled=dataset_config.get("n_samples_sampled", 4000),
             threadhold_sampled=dataset_config.get("threadhold_sampled", 150),
+            dir_validation=dataset_config.get("dir_validation"),
+            dir_test=dataset_config.get("dir_test"),
             enable_testbed=dataset_config.get("enable_testbed", False),
         )
 
@@ -97,14 +99,15 @@ if __name__ == "__main__":
                 #     if enable_dist
                 #     else "model-{epoch:03d}-{step:05d}-{val_loss:.2f}"
                 # ),
-                filename="last_{epoch:03d}",
+                filename="best-{epoch:03d}-{val_loss:.4f}",
                 save_last=True,
                 # # save_top_k=3,
                 # mode="min",
                 # monitor="val_loss_sync" if enable_dist else "val_loss",
                 every_n_epochs=1,  # Save every 5 epochs
-                save_top_k=-1,  # Save all checkpoints
-                monitor=None,  # Do not monitor any metric
+                save_top_k=1,
+                monitor="val_loss_sync" if enable_dist else "val_loss",
+                mode="min",
             )
         else:
             checkpoint_callback = ModelCheckpoint(
@@ -197,6 +200,8 @@ if __name__ == "__main__":
             sampling_method=dataset_config.get("sampling_method", "uniform"),
             n_samples_sampled=dataset_config.get("n_samples_sampled", 4000),
             threadhold_sampled=dataset_config.get("threadhold_sampled", 150),
+            dir_validation=dataset_config.get("dir_validation"),
+            dir_test=dataset_config.get("dir_test"),
             mode=args.mode,
             test_on_train=args.test_on_train,
             test_on_empirical=args.test_on_empirical,
